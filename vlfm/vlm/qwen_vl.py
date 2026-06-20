@@ -63,7 +63,7 @@ _PARSE_PROMPT = (
 def _extract_float(text: str) -> float:
     """Extract first float from model response. Returns 0.0 if none found."""
     text = text.strip()
-    matches = re.findall(r"\d+\.?\d*", text)
+    matches = re.findall(r"-?\d+\.?\d*", text)
     if not matches:
         return 0.0
     val = float(matches[0])
