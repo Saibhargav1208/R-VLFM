@@ -241,35 +241,38 @@ class QwenVLClient:
     HTTP client for QwenVLServer.
     Drop-in compatible with BLIP2ITMClient — has .cosine() method.
     Also exposes .verify_relation() and .parse_goal().
+
+    NOTE: matches the single-route pattern used by host_model() in this
+    codebase (see blip2itm.py) — one URL, payload differentiates the task
+    via an "endpoint" field, server dispatches inside process_payload().
     """
 
     def __init__(self, port: int = 12190) -> None:
-        self.base_url = f"http://localhost:{port}"
-        self.score_url = f"{self.base_url}/qwen_score"
-        self.verify_url = f"{self.base_url}/qwen_verify"
-        self.parse_url = f"{self.base_url}/qwen_parse"
+        self.url = f"http://localhost:{port}/qwen_vl"
 
     def cosine(self, image: np.ndarray, txt: str) -> float:
         """
         Drop-in for BLIP2ITMClient.cosine().
         Stage 1: scores how relevant this image is to the object name.
         """
-        response = send_request(self.score_url, image=image, object_name=txt)
+        response = send_request(self.url, endpoint="score", image=image, object_name=txt)
         return float(response["score"])
 
     def score_frontier(self, image: np.ndarray, object_name: str) -> float:
         """Stage 1 scoring — explicit API."""
-        response = send_request(self.score_url, image=image, object_name=object_name)
+        response = send_request(self.url, endpoint="score", image=image, object_name=object_name)
         return float(response["score"])
 
     def verify_relation(self, image: np.ndarray, relational_goal: str) -> float:
         """Stage 2 relational verification — the new R-VLFM contribution."""
-        response = send_request(self.verify_url, image=image, relational_goal=relational_goal)
+        response = send_request(self.url, endpoint="verify", image=image, relational_goal=relational_goal)
         return float(response["score"])
 
     def parse_goal(self, goal_text: str) -> Dict:
         """Parse free-form goal text into structured dict."""
-        response = send_request(self.parse_url, image=None, goal_text=goal_text)
+        # No image needed for parsing, but send_request requires consistent payload;
+        # server side substitutes a blank image internally.
+        response = send_request(self.url, endpoint="parse", goal_text=goal_text)
         return response["parsed"]
 
 
@@ -313,13 +316,6 @@ if __name__ == "__main__":
 
     qwen = QwenVLServer(model_name=args.model)
     print(f"[QwenVL Server] Hosting on port {args.port} ...")
-    host_model(
-        qwen,
-        name="qwen_vl",
-        port=args.port,
-        routes=[
-            ("/qwen_score",  lambda p: qwen.process_payload({**p, "endpoint": "score"})),
-            ("/qwen_verify", lambda p: qwen.process_payload({**p, "endpoint": "verify"})),
-            ("/qwen_parse",  lambda p: qwen.process_payload({**p, "endpoint": "parse"})),
-        ],
-    )
+    # Single route /qwen_vl, matching the actual host_model() signature
+    # (it does not support a routes= kwarg — that was a bug, now fixed)
+    host_model(qwen, name="qwen_vl", port=args.port)

@@ -187,6 +187,67 @@ class RVLFMPolicy(ITMPolicyV2):
 
     # ── Stage-2: relational verification ─────────────────────────────────────
 
+    # ── Frontier sorting (Stage 1 + Stage 2) ──────────────────────────────────
+    #
+    # IMPORTANT: We override _sort_frontiers_by_value (not _get_best_frontier).
+    # BaseITMPolicy._get_best_frontier contains cyclic-frontier suppression and
+    # "stick to last point" stability logic (see itm_policy.py lines 91-150).
+    # An earlier version of this file overrode _get_best_frontier directly,
+    # which silently discarded that stability logic for relational goals —
+    # the robot could oscillate between frontiers with similar Stage-2 scores.
+    # Overriding _sort_frontiers_by_value instead means Stage-2 reranking
+    # happens BEFORE the base class's stability logic runs, so cyclic
+    # suppression and frontier-sticking work correctly for both simple and
+    # relational goals.
+
+    def _sort_frontiers_by_value(
+        self,
+        observations: Union[Dict[str, Tensor], "TensorDict"],
+        frontiers: np.ndarray,
+    ) -> Tuple[np.ndarray, List[float]]:
+        """
+        Stage 1 (inherited): self._value_map.sort_waypoints() — same as VLFM.
+        Stage 2 (new): re-rank the top-K Stage-1 frontiers using Qwen
+                       relational verification. Only runs when the goal
+                       contains a spatial relation; otherwise behaves
+                       identically to vanilla VLFM.
+        """
+        # Stage 1 — identical to ITMPolicyV2
+        sorted_pts, sorted_values = self._value_map.sort_waypoints(frontiers, 0.5)
+
+        if not self._is_relational or len(sorted_pts) == 0:
+            return sorted_pts, sorted_values
+
+        # Stage 2 — relational verification on top-K candidates
+        candidates_idx = [
+            i for i, s1 in enumerate(sorted_values) if s1 >= STAGE1_MIN_SCORE
+        ][:TOP_K_VERIFY]
+
+        if not candidates_idx:
+            print("[R-VLFM] All Stage-1 scores below threshold, skipping Stage-2.")
+            return sorted_pts, sorted_values
+
+        print(f"[R-VLFM] Running Stage-2 on top-{len(candidates_idx)} candidates...")
+
+        new_values = list(sorted_values)
+        for i in candidates_idx:
+            pt = sorted_pts[i]
+            s1 = sorted_values[i]
+            s2 = self._stage2_verify(pt)
+            combined = STAGE1_WEIGHT * s1 + STAGE2_WEIGHT * s2
+            print(f"[R-VLFM]   frontier {pt} | s1={s1:.3f} | s2={s2:.3f} | combined={combined:.3f}")
+            new_values[i] = combined
+
+        # Re-sort by the updated (combined) values, keeping points paired correctly.
+        # Frontiers NOT in candidates_idx keep their original Stage-1 score, so they
+        # can still be chosen if all verified candidates score worse on Stage-2 —
+        # e.g. if the cup is not actually on any of the top-3 candidate frontiers.
+        order = np.argsort(new_values)[::-1]
+        sorted_pts = np.array(sorted_pts)[order]
+        sorted_values = [new_values[i] for i in order]
+
+        return sorted_pts, sorted_values
+
     def _get_frontier_rgb(self, frontier_xy: np.ndarray) -> Optional[np.ndarray]:
         """
         Retrieve the cached RGB image spatially closest to frontier_xy.
@@ -221,73 +282,6 @@ class RVLFMPolicy(ITMPolicyV2):
         except Exception as e:
             print(f"[R-VLFM] Stage-2 verify failed: {e}")
             return 0.5
-
-    # ── Best frontier selection (Stage 1 + Stage 2) ──────────────────────────
-
-    def _get_best_frontier(
-        self,
-        observations: Union[Dict[str, Tensor], "TensorDict"],
-        frontiers: np.ndarray,
-    ) -> Tuple[np.ndarray, float]:
-        """
-        Two-stage frontier selection:
-
-        Stage 1 (inherited): Sort all frontiers by value map score.
-        Stage 2 (new): Verify top-K frontiers with Qwen relational VQA.
-                       Only active when goal is relational (e.g. "cup on desk").
-
-        Returns the frontier with the highest combined score.
-        """
-        # ── Stage 1: get sorted frontiers from value map (original VLFM logic)
-        sorted_pts, sorted_values = self._sort_frontiers_by_value(observations, frontiers)
-
-        if not self._is_relational:
-            # Simple goal (e.g. "chair") — no Stage-2 needed
-            # Fall through to original _get_best_frontier logic
-            return super()._get_best_frontier(observations, frontiers)
-
-        # ── Stage 2: relational verification on top-K candidates ─────────────
-
-        # Candidate pool: top-K frontiers with Stage-1 score above threshold
-        candidates = [
-            (pt, s1)
-            for pt, s1 in zip(sorted_pts, sorted_values)
-            if s1 >= STAGE1_MIN_SCORE
-        ][:TOP_K_VERIFY]
-
-        if not candidates:
-            # All Stage-1 scores below threshold — fall back to Stage-1 only
-            print("[R-VLFM] All Stage-1 scores below threshold, skipping Stage-2.")
-            return super()._get_best_frontier(observations, frontiers)
-
-        print(f"[R-VLFM] Running Stage-2 on top-{len(candidates)} candidates...")
-
-        # Compute combined scores
-        combined: List[Tuple[np.ndarray, float]] = []
-        for pt, s1 in candidates:
-            s2 = self._stage2_verify(pt)
-            final_score = STAGE1_WEIGHT * s1 + STAGE2_WEIGHT * s2
-            print(
-                f"[R-VLFM]   frontier {pt} | "
-                f"s1={s1:.3f} | s2={s2:.3f} | combined={final_score:.3f}"
-            )
-            combined.append((pt, final_score))
-
-        # Sort by combined score descending
-        combined.sort(key=lambda x: x[1], reverse=True)
-
-        best_frontier, best_score = combined[0]
-
-        os.environ["DEBUG_INFO"] = (
-            f"R-VLFM Stage2 best: {best_score*100:.1f}% "
-            f"(goal: '{self._relational_goal}')"
-        )
-        print(f"[R-VLFM] Best frontier selected: {best_frontier} | score={best_score:.3f}")
-
-        self._last_frontier = best_frontier
-        self._last_value = best_score
-
-        return best_frontier, best_score
 
     # ── Policy info (adds R-VLFM debug info to visualization) ────────────────
 
